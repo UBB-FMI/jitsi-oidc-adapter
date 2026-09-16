@@ -5,6 +5,7 @@ export const OIDC_CLIENT_ID = Deno.env.get("OIDC_CLIENT_ID") || "jitsi";
 export const OIDC_CLIENT_SECRET = Deno.env.get("OIDC_CLIENT_SECRET") || "";
 export const OIDC_SCOPES = Deno.env.get("OIDC_SCOPES") ||
   "openid profile email";
+export const PUBLIC_URL = Deno.env.get("PUBLIC_URL") || "";
 
 // jwt
 export const JWT_ALG = Deno.env.get("JWT_ALG") || "HS256";
@@ -18,3 +19,10 @@ export const HOSTNAME = Deno.env.get("HOSTNAME") || "127.0.0.1";
 export const PORT = Number(Deno.env.get("PORT") || 9000);
 export const AUTO_RETURN_TO_APP =
   Deno.env.get("AUTO_RETURN_TO_APP")?.toLowerCase() === "true";
+
+// FMI meeting scheduler
+export const SCHEDULER_DATA_FILE = Deno.env.get("SCHEDULER_DATA_FILE") ||
+  "/data/meetings.json";
+export const MEETING_INACTIVE_HOURS = Number(
+  Deno.env.get("MEETING_INACTIVE_HOURS") || 8,
+);

@@ -1,7 +1,7 @@
-import { STATUS_CODE } from "jsr:@std/http@^1.0.25/status";
-import { encodeBase64 } from "jsr:@std/encoding@^1.0.10/base64";
-import { create, getNumericDate } from "jsr:@emrahcom/jwt@^0.4.8";
-import type { Algorithm } from "jsr:@emrahcom/jwt@^0.4.8/algorithm";
+import { STATUS_CODE } from "jsr:@std/http@1.1.3/status";
+import { encodeBase64 } from "jsr:@std/encoding@1.0.11/base64";
+import { create, getNumericDate } from "jsr:@emrahcom/jwt@0.4.10";
+import type { Algorithm } from "jsr:@emrahcom/jwt@0.4.10/algorithm";
 import {
   AUTO_RETURN_TO_APP,
   HOSTNAME,
@@ -15,9 +15,20 @@ import {
   OIDC_ISSUER_URL,
   OIDC_SCOPES,
   PORT,
+  PUBLIC_URL,
 } from "./config.ts";
 import { createContext } from "./context.ts";
 import type { UserInfo } from "./context.ts";
+import {
+  finishedPage,
+  htmlResponse,
+  landingPage,
+  meetingPage,
+  MeetingStore,
+  newMeetingPage,
+  scheduledCreatedPage,
+  waitingPage,
+} from "./scheduler.ts";
 
 // -----------------------------------------------------------------------------
 // Globals
@@ -27,13 +38,21 @@ let AUTH_ENDPOINT = "";
 let TOKEN_ENDPOINT = "";
 let USERINFO_ENDPOINT = "";
 let CRYPTO_KEY: CryptoKey;
+const MEETINGS = new MeetingStore();
+const HOST_LAUNCHES = new Map<string, { meetingId: string; jwt: string; expires: number }>();
 
 interface StateType {
   android?: boolean;
   electron?: boolean;
   ios?: boolean;
-  room: string;
+  room?: string;
   tenant?: string;
+  fmiAction?: string;
+  meetingId?: string;
+  mode?: string;
+  startIso?: string;
+  timeZone?: string;
+  title?: string;
   [key: string]: boolean | string | undefined;
 }
 
@@ -89,6 +108,33 @@ function unauthorized(): Response {
   return new Response(null, {
     status: STATUS_CODE.Unauthorized,
   });
+}
+
+function seeOther(url: string): Response {
+  return Response.redirect(url, 303);
+}
+
+function publicOrigin(req: Request): string {
+  return getExternalUrl(req).origin;
+}
+
+function userDisplayName(userInfo: UserInfo): string {
+  return userInfo.name?.trim() || userInfo.preferred_username?.trim() ||
+    userInfo.email?.trim() || "FMI moderator";
+}
+
+function issueHostLaunch(meetingId: string, jwt: string): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const key = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  HOST_LAUNCHES.set(key, { meetingId, jwt, expires: Date.now() + 5 * 60_000 });
+  return key;
+}
+
+function consumeHostLaunch(key: string, meetingId: string): string {
+  const launch = HOST_LAUNCHES.get(key);
+  HOST_LAUNCHES.delete(key);
+  if (!launch || launch.meetingId !== meetingId || launch.expires < Date.now()) return "";
+  return launch.jwt;
 }
 
 // -----------------------------------------------------------------------------
@@ -147,7 +193,6 @@ async function getAuthUri(redirectUri: string, state: string) {
     client_id: OIDC_CLIENT_ID,
     response_type: "code",
     scope: OIDC_SCOPES,
-    prompt: "consent",
     redirect_uri: redirectUri,
     state: state,
   });
@@ -156,18 +201,33 @@ async function getAuthUri(redirectUri: string, state: string) {
 }
 
 // -----------------------------------------------------------------------------
+// Use the configured public URL instead of trusting the reverse-proxy Host
+// header. Falling back to Host preserves upstream behavior for other users.
+// -----------------------------------------------------------------------------
+function getExternalUrl(req: Request): URL {
+  const configured = PUBLIC_URL.trim();
+  const host = req.headers.get("host");
+  const externalUrl = new URL(configured || `https://${host}`);
+
+  if (externalUrl.protocol !== "https:") {
+    throw new Error("PUBLIC_URL must use https");
+  }
+
+  return externalUrl;
+}
+
+// -----------------------------------------------------------------------------
 // Redirect the user to the OIDC auth page to get the short-term auth code.
 // -----------------------------------------------------------------------------
 async function auth(req: Request): Promise<Response> {
   try {
-    const host = req.headers.get("host");
-    if (!host) throw new Error("host not found");
+    const externalUrl = getExternalUrl(req);
 
     const url = new URL(req.url);
     const state = url.searchParams.get("state");
     if (!state) throw new Error("state not found");
 
-    const redirectUri = `https://${host}/oidc/tokenize`;
+    const redirectUri = new URL("/oidc/tokenize", externalUrl).toString();
     const authPage = await getAuthUri(redirectUri, state);
 
     return Response.redirect(authPage, STATUS_CODE.Found);
@@ -397,8 +457,8 @@ function generateTokenizeResponse(uri: string, client: ClientType): Response {
 // -----------------------------------------------------------------------------
 async function tokenize(req: Request): Promise<Response> {
   try {
-    const host = req.headers.get("host");
-    if (!host) throw new Error("host not found");
+    const externalUrl = getExternalUrl(req);
+    const host = externalUrl.host;
 
     const url = new URL(req.url);
     const searchParams = url.searchParams;
@@ -410,16 +470,53 @@ async function tokenize(req: Request): Promise<Response> {
     if (!jsonState) throw new Error("state not found");
 
     const state = JSON.parse(jsonState) as StateType;
-    const sub = getSub(host, state.tenant);
-    const room = state.room;
-    if (!room) throw new Error("room not found in state");
-
-    // Detect client type
-    const client = detectClientType(state);
     // Get the OIDC access token by using the short-term auth code.
     const accessToken = await getAccessToken(host, code, jsonState);
     // Get the OIDC user info by using the access token.
     const userInfo = await getUserInfo(accessToken);
+
+    if (state.fmiAction === "create") {
+      const title = state.title?.trim() || "FMI meeting";
+      if (title.length > 120) throw new Error("meeting title too long");
+      let startAt = new Date();
+      if (state.mode === "schedule") {
+        startAt = new Date(state.startIso || "");
+        if (!Number.isFinite(startAt.getTime()) || startAt.getTime() < Date.now() - 60_000 ||
+          startAt.getTime() > Date.now() + 2 * 365 * 24 * 60 * 60 * 1000) {
+          throw new Error("invalid scheduled start");
+        }
+      }
+      const meeting = await MEETINGS.create({
+        title,
+        creatorSub: userInfo.sub,
+        creatorName: userDisplayName(userInfo),
+        startAt,
+        creatorTimeZone: state.timeZone?.slice(0, 80) || "UTC",
+      });
+      if (state.mode !== "schedule") {
+        await MEETINGS.openEarly(meeting);
+        const jwt = await generateJwt(host, `_fmi_${meeting.room}`, userInfo);
+        const hostKey = issueHostLaunch(meeting.id, jwt);
+        return seeOther(`${externalUrl.origin}/m/${meeting.id}?hostKey=${hostKey}`);
+      }
+      return seeOther(`${externalUrl.origin}/m/${meeting.id}?created=1`);
+    }
+
+    if (state.fmiAction === "host") {
+      const meeting = MEETINGS.get(state.meetingId || "");
+      if (!meeting || meeting.finishedAt || meeting.creatorSub !== userInfo.sub) {
+        return unauthorized();
+      }
+      const jwt = await generateJwt(host, `_fmi_${meeting.room}`, userInfo);
+      const hostKey = issueHostLaunch(meeting.id, jwt);
+      return seeOther(`${externalUrl.origin}/m/${meeting.id}?hostKey=${hostKey}`);
+    }
+
+    const sub = getSub(host, state.tenant);
+    const room = state.room;
+    if (!room) throw new Error("room not found in state");
+    // Detect client type
+    const client = detectClientType(state);
     // Generate Jitsi token.
     const jwt = await generateJwt(sub, room, userInfo);
     // Generate Jitsi hash.
@@ -435,6 +532,74 @@ async function tokenize(req: Request): Promise<Response> {
   }
 }
 
+async function createMeeting(req: Request): Promise<Response> {
+  const form = await req.formData();
+  const title = String(form.get("title") || "").trim();
+  const mode = String(form.get("mode") || "");
+  const startIso = String(form.get("startIso") || "");
+  const timeZone = String(form.get("timeZone") || "UTC");
+  if (!title || title.length > 120 || !["now", "schedule"].includes(mode)) {
+    return htmlResponse("Invalid meeting details", 400);
+  }
+  if (mode === "schedule") {
+    const start = new Date(startIso);
+    if (!Number.isFinite(start.getTime()) || start.getTime() < Date.now() ||
+      start.getTime() > Date.now() + 2 * 365 * 24 * 60 * 60 * 1000) {
+      return htmlResponse("Invalid scheduled start", 400);
+    }
+  }
+  const state = JSON.stringify({ fmiAction: "create", title, mode, startIso, timeZone });
+  return seeOther(`${publicOrigin(req)}/oidc/auth?state=${encodeURIComponent(state)}`);
+}
+
+function meetingRoute(req: Request, id: string): Response {
+  const meeting = MEETINGS.get(id);
+  if (!meeting) return htmlResponse("Meeting not found", 404);
+  if (meeting.finishedAt) return htmlResponse(finishedPage(meeting), 410);
+  const url = new URL(req.url);
+  if (url.searchParams.get("created") === "1") {
+    return htmlResponse(scheduledCreatedPage(meeting, publicOrigin(req)));
+  }
+  const hostKey = url.searchParams.get("hostKey") || "";
+  const hostJwt = hostKey ? consumeHostLaunch(hostKey, meeting.id) : "";
+  if (!hostJwt && !MEETINGS.isOpen(meeting)) return htmlResponse(waitingPage(meeting));
+  return htmlResponse(meetingPage(meeting, hostJwt), 200, {
+    "Set-Cookie": MEETINGS.cookieFor(meeting, Boolean(hostJwt)),
+  });
+}
+
+function hostRoute(req: Request, id: string): Response {
+  const meeting = MEETINGS.get(id);
+  if (!meeting) return htmlResponse("Meeting not found", 404);
+  if (meeting.finishedAt) return htmlResponse(finishedPage(meeting), 410);
+  const state = JSON.stringify({ fmiAction: "host", meetingId: meeting.id });
+  return seeOther(`${publicOrigin(req)}/oidc/auth?state=${encodeURIComponent(state)}`);
+}
+
+function authorizeRoom(req: Request): Response {
+  const original = req.headers.get("x-original-uri") || "";
+  const room = original.split(/[?#]/, 1)[0].replace(/^\//, "");
+  const meeting = MEETINGS.authorizeCookie(req.headers.get("cookie") || "", room);
+  return new Response(null, { status: meeting ? 204 : 401 });
+}
+
+async function updatePresence(req: Request): Promise<Response> {
+  const form = await req.formData();
+  const meeting = MEETINGS.get(String(form.get("meetingId") || ""));
+  if (!meeting || !MEETINGS.authorizeCookie(
+    req.headers.get("cookie") || "",
+    `_fmi_${meeting.room}`,
+  )) return unauthorized();
+  const action = String(form.get("action") || "");
+  if (action === "join" && !MEETINGS.isOpen(meeting)) await MEETINGS.openEarly(meeting);
+  await MEETINGS.presence(
+    meeting,
+    String(form.get("sessionId") || ""),
+    action,
+  );
+  return ok("ok");
+}
+
 // -----------------------------------------------------------------------------
 // handler
 // -----------------------------------------------------------------------------
@@ -442,6 +607,8 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
+  if (req.method === "POST" && path === "/fmi/create") return await createMeeting(req);
+  if (req.method === "POST" && path === "/fmi/presence") return await updatePresence(req);
   if (req.method !== "GET") return methodNotAllowed();
 
   if (path === "/health") {
@@ -452,6 +619,24 @@ async function handler(req: Request): Promise<Response> {
     return await auth(req);
   } else if (path === "/oidc/tokenize") {
     return await tokenize(req);
+  } else if (path === "/fmi/landing") {
+    return htmlResponse(landingPage());
+  } else if (path === "/fmi/new") {
+    return htmlResponse(newMeetingPage());
+  } else if (path === "/fmi/authorize") {
+    return authorizeRoom(req);
+  } else if (path.startsWith("/fmi/status/")) {
+    const meeting = MEETINGS.get(path.slice("/fmi/status/".length));
+    if (!meeting) return notFound();
+    return Response.json({
+      open: MEETINGS.isOpen(meeting),
+      finished: Boolean(meeting.finishedAt),
+      startAt: meeting.startAt,
+    }, { headers: { "Cache-Control": "no-store" } });
+  } else if (path.startsWith("/fmi/host/")) {
+    return hostRoute(req, path.slice("/fmi/host/".length));
+  } else if (path.startsWith("/m/")) {
+    return meetingRoute(req, path.slice("/m/".length));
   } else {
     return notFound();
   }
@@ -463,6 +648,8 @@ async function handler(req: Request): Promise<Response> {
 async function main() {
   // Generate the crypto key and use it during the process lifetime.
   await setCryptoKey();
+  await MEETINGS.init();
+  setInterval(() => MEETINGS.sweep().catch(console.error), 30_000);
 
   // Get OIDC endpoints. It will try later if it fails in the initial try.
   await getEndpoints();
@@ -473,6 +660,7 @@ async function main() {
     `OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET ? "*** masked ***" : "not used"}`,
   );
   console.log(`OIDC_SCOPES: ${OIDC_SCOPES}`);
+  console.log(`PUBLIC_URL: ${PUBLIC_URL || "derived from request"}`);
   console.log(`JWT_ALG: ${JWT_ALG}`);
   console.log(`JWT_HASH: ${JWT_HASH}`);
   console.log(`JWT_APP_ID: ${JWT_APP_ID}`);
