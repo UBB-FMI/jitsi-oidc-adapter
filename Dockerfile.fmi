@@ -2,8 +2,9 @@ FROM denoland/deno:2.5.3@sha256:9334bc0b53b6f956b11a943b43e94d6c239a3d1de3515d8d
 
 WORKDIR /app
 
-COPY src/config.ts src/context.ts src/scheduler.ts src/adapter.ts /app/
+COPY src/config.ts src/context.ts src/security.ts src/scheduler.ts src/adapter.ts /app/
 
+RUN chmod a+r /app/*.ts
 RUN deno cache --frozen=false /app/adapter.ts && deno check /app/adapter.ts
 
 ENV HOSTNAME=0.0.0.0

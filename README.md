@@ -19,6 +19,33 @@ to provide more general OIDC support.
 - Better integration with Jitsi's built-in features for authentication flow.
 - Allows guest users and `wait for host` screen if needed.
 
+The FMI deployment adds a scheduler at `/m/<code>`: Microsoft-authenticated
+creators can recover their meetings from `/fmi/mine`, while attendees enter
+without Microsoft sign-in. The public `/m/<code>` URL is the only link to share.
+My meetings groups in-progress, upcoming, available, and past meetings, using
+the viewer's local time. Creators can cancel a meeting before anyone is in it;
+the share link then closes immediately. Never-started meetings close seven
+days after their scheduled start, and meetings that ran close eight hours
+after their last participant leaves.
+The official mobile and desktop apps launch through `/fmi/app/<code>` with a
+room-scoped, expiring grant; never share a native launch URL or a Jitsi JWT.
+Native links put Jitsi's meeting title and canonical invite alias in the URL
+fragment, which the stock apps use for display and sharing. Query parameters
+alone do not apply those overrides on Android.
+Native guests receive a short-lived room-scoped adapter ticket, not a Jitsi
+JWT. Only authenticated creators receive a moderator JWT. The stock Windows
+Electron app currently drops launch query/fragment parameters, so its native
+handoff requires the patch documented in the private deployment repository.
+When `PROSODY_CENSUS_URL` is configured, actual Prosody room occupancy controls
+early opening and the empty-room expiration timer, including native clients.
+
+Run the FMI checks with:
+
+```sh
+deno check src/adapter.ts
+deno test --allow-read --allow-write --allow-env --allow-net --allow-run tests
+```
+
 ## 2. Setup
 
 See [standalone setup](./docs/setup-standalone.md) guide to install it on a

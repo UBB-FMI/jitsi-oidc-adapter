@@ -15,16 +15,20 @@ import {
   OIDC_ISSUER_URL,
   OIDC_SCOPES,
   PORT,
+  PROSODY_CENSUS_URL,
   PUBLIC_URL,
 } from "./config.ts";
 import { createContext } from "./context.ts";
 import type { UserInfo } from "./context.ts";
+import { cookieValue, SignedTokens } from "./security.ts";
 import {
+  appLaunchPage,
   finishedPage,
   htmlResponse,
   landingPage,
   meetingPage,
   MeetingStore,
+  myMeetingsPage,
   newMeetingPage,
   scheduledCreatedPage,
   waitingPage,
@@ -38,8 +42,11 @@ let AUTH_ENDPOINT = "";
 let TOKEN_ENDPOINT = "";
 let USERINFO_ENDPOINT = "";
 let CRYPTO_KEY: CryptoKey;
-const MEETINGS = new MeetingStore();
-const HOST_LAUNCHES = new Map<string, { meetingId: string; jwt: string; expires: number }>();
+const MEETINGS = new MeetingStore(Boolean(PROSODY_CENSUS_URL));
+const TOKENS = new SignedTokens(JWT_APP_SECRET);
+const SESSION_COOKIE = "__Host-fmi_identity";
+const SESSION_SECONDS = 7 * 24 * 60 * 60;
+const APP_TICKET_SECONDS = 12 * 60 * 60;
 
 interface StateType {
   android?: boolean;
@@ -123,18 +130,31 @@ function userDisplayName(userInfo: UserInfo): string {
     userInfo.email?.trim() || "FMI moderator";
 }
 
-function issueHostLaunch(meetingId: string, jwt: string): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(24));
-  const key = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
-  HOST_LAUNCHES.set(key, { meetingId, jwt, expires: Date.now() + 5 * 60_000 });
-  return key;
+async function sessionUser(req: Request): Promise<UserInfo | undefined> {
+  const token = cookieValue(req.headers.get("cookie") || "", SESSION_COOKIE);
+  const claims = await TOKENS.verify("session", token);
+  if (!claims || typeof claims.sub !== "string" || !claims.sub) return undefined;
+  return {
+    sub: claims.sub,
+    name: typeof claims.name === "string" ? claims.name : undefined,
+    email: typeof claims.email === "string" ? claims.email : undefined,
+  };
 }
 
-function consumeHostLaunch(key: string, meetingId: string): string {
-  const launch = HOST_LAUNCHES.get(key);
-  HOST_LAUNCHES.delete(key);
-  if (!launch || launch.meetingId !== meetingId || launch.expires < Date.now()) return "";
-  return launch.jwt;
+async function redirectWithSession(url: string, userInfo: UserInfo): Promise<Response> {
+  const token = await TOKENS.issue("session", {
+    sub: userInfo.sub,
+    name: userDisplayName(userInfo).slice(0, 120),
+    email: (userInfo.email || "").slice(0, 200),
+  }, SESSION_SECONDS);
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: url,
+      "Set-Cookie": `${SESSION_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SESSION_SECONDS}`,
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -153,7 +173,7 @@ async function setCryptoKey() {
       hash: JWT_HASH,
     },
     true,
-    ["sign"],
+    ["sign", "verify"],
   );
 }
 
@@ -332,6 +352,7 @@ async function generateJwt(
   sub: string,
   room: string,
   userInfo: UserInfo,
+  lifetimeSeconds = JWT_EXP_SECOND,
 ): Promise<string> {
   const header = { typ: "JWT", alg: JWT_ALG as Algorithm };
   const payload = {
@@ -341,7 +362,7 @@ async function generateJwt(
     room: room,
     iat: getNumericDate(0),
     nbf: getNumericDate(0),
-    exp: getNumericDate(JWT_EXP_SECOND),
+    exp: getNumericDate(lifetimeSeconds),
     context: createContext(userInfo),
   };
 
@@ -401,12 +422,11 @@ function getMeetingUri(
 
   let uri = `${host}/${tenant}/${room}`;
   uri = uri.replace(/\/+/g, "/");
-  uri = `${scheme}://${uri}?jwt=${jwt}#${hash}`;
+  uri = `${scheme}://${uri}?jwt=${encodeURIComponent(jwt)}`;
   if (client == ClientType.android) {
-    uri += "#Intent;scheme=org.jitsi.meet;package=org.jitsi.meet;end";
+    return `${uri}#Intent;scheme=org.jitsi.meet;package=org.jitsi.meet;end`;
   }
-
-  return uri;
+  return `${uri}#${hash}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -475,6 +495,10 @@ async function tokenize(req: Request): Promise<Response> {
     // Get the OIDC user info by using the access token.
     const userInfo = await getUserInfo(accessToken);
 
+    if (state.fmiAction === "mine") {
+      return await redirectWithSession(`${externalUrl.origin}/fmi/mine`, userInfo);
+    }
+
     if (state.fmiAction === "create") {
       const title = state.title?.trim() || "FMI meeting";
       if (title.length > 120) throw new Error("meeting title too long");
@@ -495,11 +519,9 @@ async function tokenize(req: Request): Promise<Response> {
       });
       if (state.mode !== "schedule") {
         await MEETINGS.openEarly(meeting);
-        const jwt = await generateJwt(host, `_fmi_${meeting.room}`, userInfo);
-        const hostKey = issueHostLaunch(meeting.id, jwt);
-        return seeOther(`${externalUrl.origin}/m/${meeting.id}?hostKey=${hostKey}`);
+        return await redirectWithSession(`${externalUrl.origin}/m/${meeting.id}`, userInfo);
       }
-      return seeOther(`${externalUrl.origin}/m/${meeting.id}?created=1`);
+      return await redirectWithSession(`${externalUrl.origin}/m/${meeting.id}?created=1`, userInfo);
     }
 
     if (state.fmiAction === "host") {
@@ -507,14 +529,17 @@ async function tokenize(req: Request): Promise<Response> {
       if (!meeting || meeting.finishedAt || meeting.creatorSub !== userInfo.sub) {
         return unauthorized();
       }
-      const jwt = await generateJwt(host, `_fmi_${meeting.room}`, userInfo);
-      const hostKey = issueHostLaunch(meeting.id, jwt);
-      return seeOther(`${externalUrl.origin}/m/${meeting.id}?hostKey=${hostKey}`);
+      return await redirectWithSession(`${externalUrl.origin}/m/${meeting.id}`, userInfo);
     }
 
     const sub = getSub(host, state.tenant);
     const room = state.room;
     if (!room) throw new Error("room not found in state");
+    if (room.startsWith("_fmi_")) {
+      const meeting = MEETINGS.findByInternalRoom(room);
+      if (!meeting || meeting.finishedAt || meeting.creatorSub !== userInfo.sub) return unauthorized();
+      return await redirectWithSession(`${externalUrl.origin}/m/${meeting.id}`, userInfo);
+    }
     // Detect client type
     const client = detectClientType(state);
     // Generate Jitsi token.
@@ -552,35 +577,113 @@ async function createMeeting(req: Request): Promise<Response> {
   return seeOther(`${publicOrigin(req)}/oidc/auth?state=${encodeURIComponent(state)}`);
 }
 
-function meetingRoute(req: Request, id: string): Response {
+async function meetingRoute(req: Request, id: string): Promise<Response> {
   const meeting = MEETINGS.get(id);
   if (!meeting) return htmlResponse("Meeting not found", 404);
   if (meeting.finishedAt) return htmlResponse(finishedPage(meeting), 410);
   const url = new URL(req.url);
-  if (url.searchParams.get("created") === "1") {
+  const user = await sessionUser(req);
+  const host = user?.sub === meeting.creatorSub;
+  if (url.searchParams.get("created") === "1" && host) {
     return htmlResponse(scheduledCreatedPage(meeting, publicOrigin(req)));
   }
-  const hostKey = url.searchParams.get("hostKey") || "";
-  const hostJwt = hostKey ? consumeHostLaunch(hostKey, meeting.id) : "";
-  if (!hostJwt && !MEETINGS.isOpen(meeting)) return htmlResponse(waitingPage(meeting));
+  if (!host && !MEETINGS.isOpen(meeting)) return htmlResponse(waitingPage(meeting));
+  const hostJwt = host ? await generateJwt(getExternalUrl(req).host, `_fmi_${meeting.room}`, user) : "";
   return htmlResponse(meetingPage(meeting, hostJwt), 200, {
-    "Set-Cookie": MEETINGS.cookieFor(meeting, Boolean(hostJwt)),
+    "Set-Cookie": MEETINGS.cookieFor(meeting, host),
+    "Referrer-Policy": "no-referrer",
   });
 }
 
-function hostRoute(req: Request, id: string): Response {
+async function hostRoute(req: Request, id: string): Promise<Response> {
   const meeting = MEETINGS.get(id);
   if (!meeting) return htmlResponse("Meeting not found", 404);
   if (meeting.finishedAt) return htmlResponse(finishedPage(meeting), 410);
+  if ((await sessionUser(req))?.sub === meeting.creatorSub) {
+    return seeOther(`${publicOrigin(req)}/m/${meeting.id}`);
+  }
   const state = JSON.stringify({ fmiAction: "host", meetingId: meeting.id });
   return seeOther(`${publicOrigin(req)}/oidc/auth?state=${encodeURIComponent(state)}`);
 }
 
-function authorizeRoom(req: Request): Response {
+async function myMeetingsRoute(req: Request): Promise<Response> {
+  const user = await sessionUser(req);
+  if (!user) {
+    const state = JSON.stringify({ fmiAction: "mine" });
+    return seeOther(`${publicOrigin(req)}/oidc/auth?state=${encodeURIComponent(state)}`);
+  }
+  return htmlResponse(myMeetingsPage(MEETINGS.listByCreator(user.sub), publicOrigin(req)));
+}
+
+async function cancelMeeting(req: Request, id: string): Promise<Response> {
+  if (req.headers.get("origin") !== publicOrigin(req)) return unauthorized();
+  const user = await sessionUser(req);
+  const meeting = MEETINGS.get(id);
+  if (!user || !meeting || meeting.creatorSub !== user.sub) return unauthorized();
+  if (PROSODY_CENSUS_URL) {
+    try {
+      await pollProsodyCensus();
+    } catch {
+      return htmlResponse("Meeting status is temporarily unavailable. Please try again shortly.", 503);
+    }
+  }
+  const result = await MEETINGS.cancel(meeting);
+  if (result === "unknown") return htmlResponse("Meeting status is temporarily unavailable. Please try again shortly.", 503);
+  if (result === "active") return htmlResponse("This meeting is in progress and cannot be cancelled.", 409);
+  return seeOther(`${publicOrigin(req)}/fmi/mine`);
+}
+
+async function appRoute(req: Request, id: string): Promise<Response> {
+  const meeting = MEETINGS.get(id);
+  if (!meeting) return htmlResponse("Meeting not found", 404);
+  if (meeting.finishedAt) return htmlResponse(finishedPage(meeting), 410);
+  const user = await sessionUser(req);
+  const host = user?.sub === meeting.creatorSub;
+  if (!host && !MEETINGS.isOpen(meeting)) return htmlResponse(waitingPage(meeting));
+
+  const internalRoom = `_fmi_${meeting.room}`;
+  const ticket = await TOKENS.issue("app", {
+    id: meeting.id,
+    room: internalRoom,
+    role: host ? "host" : "guest",
+  }, APP_TICKET_SECONDS);
+  const params = new URLSearchParams({ fmiTicket: ticket });
+  if (host) {
+    params.set("jwt", await generateJwt(getExternalUrl(req).host, internalRoom, user, APP_TICKET_SECONDS));
+  }
+  // The native fragment parser does not treat '+' as a space. URLSearchParams
+  // would form-encode the subject and show literal plus signs in the app.
+  const overrides = [
+    ["config.subject", JSON.stringify(meeting.title)],
+    ["config.brandingRoomAlias", JSON.stringify(`m/${meeting.id}`)],
+    ["config.doNotStoreRoom", "true"],
+  ].map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+  const agent = req.headers.get("user-agent") || "";
+  const preferred = new URL(req.url).searchParams.get("platform");
+  const platform = preferred === "android" || preferred === "ios" || preferred === "windows"
+    ? preferred
+    : /Android/i.test(agent) ? "android" : /iPhone|iPad|iPod/i.test(agent) ? "ios" : "windows";
+  const path = `${getExternalUrl(req).host}/${internalRoom}?${params}#${overrides}`;
+  const appUrl = `${platform === "windows" ? "jitsi-meet" : "org.jitsi.meet"}://${path}`;
+  return htmlResponse(appLaunchPage(meeting, publicOrigin(req), appUrl), 200, {
+    "Referrer-Policy": "no-referrer",
+  });
+}
+
+async function authorizeRoom(req: Request): Promise<Response> {
   const original = req.headers.get("x-original-uri") || "";
   const room = original.split(/[?#]/, 1)[0].replace(/^\//, "");
-  const meeting = MEETINGS.authorizeCookie(req.headers.get("cookie") || "", room);
-  return new Response(null, { status: meeting ? 204 : 401 });
+  const meeting = MEETINGS.findByInternalRoom(room);
+  if (!meeting || meeting.finishedAt) return unauthorized();
+  if (MEETINGS.authorizeCookie(req.headers.get("cookie") || "", room)) {
+    return new Response(null, { status: 204 });
+  }
+  const ticket = new URL(original, publicOrigin(req)).searchParams.get("fmiTicket") || "";
+  const claims = await TOKENS.verify("app", ticket);
+  const allowed = claims?.id === meeting.id && claims.room === room &&
+    (claims.role === "host" || claims.role === "guest" && MEETINGS.isOpen(meeting));
+  return new Response(null, { status: allowed ? 204 : 401 });
 }
 
 async function updatePresence(req: Request): Promise<Response> {
@@ -608,6 +711,9 @@ async function handler(req: Request): Promise<Response> {
   const path = url.pathname;
 
   if (req.method === "POST" && path === "/fmi/create") return await createMeeting(req);
+  if (req.method === "POST" && path.startsWith("/fmi/cancel/")) {
+    return await cancelMeeting(req, path.slice("/fmi/cancel/".length));
+  }
   if (req.method === "POST" && path === "/fmi/presence") return await updatePresence(req);
   if (req.method !== "GET") return methodNotAllowed();
 
@@ -623,8 +729,12 @@ async function handler(req: Request): Promise<Response> {
     return htmlResponse(landingPage());
   } else if (path === "/fmi/new") {
     return htmlResponse(newMeetingPage());
+  } else if (path === "/fmi/mine") {
+    return await myMeetingsRoute(req);
   } else if (path === "/fmi/authorize") {
-    return authorizeRoom(req);
+    return await authorizeRoom(req);
+  } else if (path.startsWith("/fmi/app/")) {
+    return await appRoute(req, path.slice("/fmi/app/".length));
   } else if (path.startsWith("/fmi/status/")) {
     const meeting = MEETINGS.get(path.slice("/fmi/status/".length));
     if (!meeting) return notFound();
@@ -634,12 +744,29 @@ async function handler(req: Request): Promise<Response> {
       startAt: meeting.startAt,
     }, { headers: { "Cache-Control": "no-store" } });
   } else if (path.startsWith("/fmi/host/")) {
-    return hostRoute(req, path.slice("/fmi/host/".length));
+    return await hostRoute(req, path.slice("/fmi/host/".length));
   } else if (path.startsWith("/m/")) {
-    return meetingRoute(req, path.slice("/m/".length));
+    return await meetingRoute(req, path.slice("/m/".length));
   } else {
     return notFound();
   }
+}
+
+async function pollProsodyCensus(): Promise<void> {
+  if (!PROSODY_CENSUS_URL) return;
+  const response = await fetch(PROSODY_CENSUS_URL, { signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`Prosody census returned ${response.status}`);
+  const payload = await response.json();
+  if (!Array.isArray(payload?.room_census)) throw new Error("invalid Prosody census");
+  const counts = new Map<string, number>();
+  for (const room of payload.room_census) {
+    const name = String(room?.room_name || "").split("@", 1)[0].toLowerCase();
+    if (!/^_fmi_[a-f0-9]{32}$/.test(name)) continue;
+    const number = Number(room?.participants);
+    if (!Number.isSafeInteger(number) || number < 0) continue;
+    counts.set(name, room?.leaked ? 0 : number);
+  }
+  await MEETINGS.reconcileCensus(counts);
 }
 
 // -----------------------------------------------------------------------------
@@ -650,6 +777,11 @@ async function main() {
   await setCryptoKey();
   await MEETINGS.init();
   setInterval(() => MEETINGS.sweep().catch(console.error), 30_000);
+  if (PROSODY_CENSUS_URL) {
+    const poll = () => pollProsodyCensus().catch((error) => console.error("Prosody census unavailable:", error));
+    poll();
+    setInterval(poll, 30_000);
+  }
 
   // Get OIDC endpoints. It will try later if it fails in the initial try.
   await getEndpoints();

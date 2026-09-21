@@ -26,3 +26,4 @@ export const SCHEDULER_DATA_FILE = Deno.env.get("SCHEDULER_DATA_FILE") ||
 export const MEETING_INACTIVE_HOURS = Number(
   Deno.env.get("MEETING_INACTIVE_HOURS") || 8,
 );
+export const PROSODY_CENSUS_URL = Deno.env.get("PROSODY_CENSUS_URL") || "";
