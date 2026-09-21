@@ -32,6 +32,17 @@ Deno.test("creator meeting list and canonical invite alias", async () => {
     ) {
       throw new Error("invite alias missing");
     }
+    for (
+      const html of [meetingPage(meeting), meetingPage(meeting, "host-jwt")]
+    ) {
+      if (
+        html.includes('id="app-tools"') ||
+        html.includes("Open in Jitsi app") ||
+        html.includes("Copy meeting link")
+      ) {
+        throw new Error("meeting page still has floating app or copy controls");
+      }
+    }
     if (store.isOpen(meeting)) {
       throw new Error("scheduled meeting opened too soon");
     }
